@@ -1,0 +1,9 @@
+# Personal gig data + copyrighted content — never publish
+songs.txt
+chords/*.txt
+out/
+.env
+
+# keep the empty dirs in the repo
+!chords/.gitkeep
+!out/.gitkeep

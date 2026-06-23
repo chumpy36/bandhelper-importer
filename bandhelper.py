@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""
+bandhelper.py — turn a short list of songs into BandHelper-ready files.
+
+Workflow (matches how the band actually works):
+  1. You decide on a few songs in person.
+  2. List them in songs.txt, one per line:   Title | Artist
+     (the first comment line can set a gig tag, see below)
+  3. (Optional) For each song you want chords on, copy the chord text from
+     Ultimate Guitar and paste it into  chords/<Title>.txt
+  4. Run:  python3 bandhelper.py songs.txt
+  5. Drag the generated out/*.pro files into BandHelper (it imports ChordPro
+     natively). Or use out/import.tsv via Repertoire > Songs > Batch Import.
+
+What gets filled automatically:
+  - Duration   <- iTunes Search API      (no key)
+  - Lyrics     <- lyrics.ovh             (no key)
+  - BPM + Key  <- GetSongBPM API         (free key, set GETSONGBPM_API_KEY)
+  - Chords     <- your pasted UG text, converted to inline ChordPro
+
+GetSongBPM is optional: if no key is set, BPM/Key are just left blank.
+Register a free key at https://getsongbpm.com/api  (a backlink to their site
+is required by their terms — already included in the README).
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import urllib.parse
+import urllib.request
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) BandHelperImporter/1.0"
+GETSONGBPM_KEY = os.environ.get("GETSONGBPM_API_KEY", "").strip()
+GETSONGBPM_HOST = os.environ.get("GETSONGBPM_HOST", "https://api.getsong.co")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CHORDS_DIR = os.path.join(HERE, "chords")
+OUT_DIR = os.path.join(HERE, "out")
+
+
+# ----------------------------------------------------------------------------- HTTP
+def _get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _get_json(url):
+    return json.loads(_get(url))
+
+
+# ----------------------------------------------------------------------------- lookups
+def itunes(title, artist):
+    """Return (canonical_title, canonical_artist, duration 'm:ss') or (None,...)."""
+    q = urllib.parse.quote(f"{title} {artist}")
+    url = f"https://itunes.apple.com/search?term={q}&entity=song&limit=1"
+    try:
+        res = _get_json(url).get("results", [])
+        if not res:
+            return None, None, None
+        d = res[0]
+        ms = d.get("trackTimeMillis")
+        dur = f"{ms // 60000}:{(ms // 1000) % 60:02d}" if ms else None
+        return d.get("trackName"), d.get("artistName"), dur
+    except Exception as e:
+        print(f"    ! iTunes lookup failed: {e}")
+        return None, None, None
+
+
+def lyrics(title, artist):
+    url = (f"https://api.lyrics.ovh/v1/"
+           f"{urllib.parse.quote(artist)}/{urllib.parse.quote(title)}")
+    try:
+        return (_get_json(url).get("lyrics") or "").strip()
+    except Exception:
+        return ""
+
+
+def getsongbpm(title, artist):
+    """Return (bpm, key) or ('',''). Requires GETSONGBPM_API_KEY."""
+    if not GETSONGBPM_KEY:
+        return "", ""
+    lookup = urllib.parse.quote(f"song:{title} artist:{artist}")
+    url = (f"{GETSONGBPM_HOST}/search/?api_key={GETSONGBPM_KEY}"
+           f"&type=both&lookup={lookup}")
+    try:
+        data = _get_json(url)
+        hits = data.get("search") or []
+        if isinstance(hits, dict):  # API returns an error object sometimes
+            return "", ""
+        if not hits:
+            return "", ""
+        h = hits[0]
+        bpm = str(h.get("tempo") or "").strip()
+        key = (h.get("key_of") or "").strip()
+        return bpm, key
+    except Exception as e:
+        print(f"    ! GetSongBPM lookup failed: {e}")
+        return "", ""
+
+
+# ----------------------------------------------------------------------------- chords
+CHORD_RE = re.compile(
+    r"^[A-G][#b]?(?:m|maj|min|dim|aug|sus|add|M)?[0-9]?(?:[#b]?[0-9])?"
+    r"(?:/[A-G][#b]?)?$"
+)
+
+
+def _is_chord_line(line):
+    toks = line.split()
+    if not toks:
+        return False
+    good = sum(1 for t in toks if CHORD_RE.match(t))
+    return good == len(toks) and good >= 1
+
+
+def ug_to_chordpro(text):
+    """Convert Ultimate-Guitar copy-paste (chords above lyrics) to ChordPro."""
+    out_lines = []
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        # UG section headers: [Verse], [Chorus], etc.
+        m = re.match(r"^\[(.+?)\]\s*$", line.strip())
+        if m:
+            out_lines.append(f"{{comment: {m.group(1)}}}")
+            i += 1
+            continue
+        if _is_chord_line(line):
+            nxt = lines[i + 1].rstrip() if i + 1 < len(lines) else ""
+            if nxt and not _is_chord_line(nxt):
+                out_lines.append(_merge(line, nxt))
+                i += 2
+                continue
+            # chord-only line (intro/instrumental)
+            out_lines.append(" ".join(f"[{t}]" for t in line.split()))
+            i += 1
+            continue
+        out_lines.append(line)
+        i += 1
+    return "\n".join(out_lines).strip()
+
+
+def _merge(chord_line, lyric_line):
+    """Place [chords] inline above the lyric at the right column positions."""
+    positions = []  # (col, chord)
+    for mt in re.finditer(r"\S+", chord_line):
+        positions.append((mt.start(), mt.group(0)))
+    if len(lyric_line) < len(chord_line):
+        lyric_line = lyric_line + " " * (len(chord_line) - len(lyric_line))
+    out = []
+    last = 0
+    for col, chord in positions:
+        col = min(col, len(lyric_line))
+        out.append(lyric_line[last:col])
+        out.append(f"[{chord}]")
+        last = col
+    out.append(lyric_line[last:])
+    return "".join(out).rstrip()
+
+
+def load_chords(title):
+    for name in (title, title.lower()):
+        p = os.path.join(CHORDS_DIR, f"{name}.txt")
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                return ug_to_chordpro(f.read())
+    return ""
+
+
+# ----------------------------------------------------------------------------- output
+def safe(name):
+    return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+
+
+def write_chordpro(song, tag):
+    lines = [f"{{title: {song['title']}}}", f"{{artist: {song['artist']}}}"]
+    if song["key"]:
+        lines.append(f"{{key: {song['key']}}}")
+    if song["bpm"]:
+        lines.append(f"{{tempo: {song['bpm']}}}")
+    if song["duration"]:
+        lines.append(f"{{time: {song['duration']}}}")
+    if tag:
+        lines.append(f"{{meta: tags {tag}}}")
+    lines.append("")
+    if song["chords"]:
+        lines.append(song["chords"])
+    elif song["lyrics"]:
+        lines.append(song["lyrics"])
+    path = os.path.join(OUT_DIR, f"{safe(song['title'])}.pro")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+TSV_COLS = ["Title", "Artist", "Tags", "Key", "Time signature", "Tempo",
+            "Duration", "Lyrics", "Chords"]
+
+
+def write_tsv(songs, tag):
+    path = os.path.join(OUT_DIR, "import.tsv")
+    with open(path, "w", encoding="utf-8") as f:
+        for s in songs:
+            row = [s["title"], s["artist"], tag, s["key"], "", s["bpm"],
+                   s["duration"],
+                   s["lyrics"].replace("\n", "\\n"),
+                   s["chords"].replace("\n", "\\n")]
+            f.write("\t".join(c or "" for c in row) + "\n")
+    return path
+
+
+# ----------------------------------------------------------------------------- main
+def parse_input(path):
+    tag = ""
+    songs = []
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                m = re.search(r"tag\s*:\s*(.+)", line, re.I)
+                if m:
+                    tag = m.group(1).strip()
+                continue
+            parts = re.split(r"\s*[|\-—]\s*", line, maxsplit=1)
+            title = parts[0].strip()
+            artist = parts[1].strip() if len(parts) > 1 else ""
+            songs.append((title, artist))
+    return tag, songs
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: python3 bandhelper.py songs.txt")
+        sys.exit(1)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(CHORDS_DIR, exist_ok=True)
+    tag, pairs = parse_input(sys.argv[1])
+    if tag:
+        print(f"Gig tag: {tag}")
+    if not GETSONGBPM_KEY:
+        print("(no GETSONGBPM_API_KEY set — BPM/Key will be blank)\n")
+
+    results = []
+    for title, artist in pairs:
+        print(f"• {title} — {artist or '?'}")
+        c_title, c_artist, dur = itunes(title, artist)
+        title = c_title or title
+        artist = c_artist or artist
+        bpm, key = getsongbpm(title, artist)
+        song = {
+            "title": title, "artist": artist, "duration": dur or "",
+            "bpm": bpm, "key": key,
+            "lyrics": lyrics(title, artist),
+            "chords": load_chords(title),
+        }
+        got = []
+        if dur:
+            got.append(f"dur {dur}")
+        if bpm:
+            got.append(f"{bpm} bpm")
+        if key:
+            got.append(f"key {key}")
+        if song["lyrics"]:
+            got.append("lyrics")
+        got.append("CHORDS" if song["chords"] else "no-chords(paste UG)")
+        print("    " + ", ".join(got))
+        p = write_chordpro(song, tag)
+        print(f"    -> {os.path.relpath(p, HERE)}")
+        results.append(song)
+        time.sleep(0.3)  # be polite to the free APIs
+
+    tsv = write_tsv(results, tag)
+    print(f"\nDone. {len(results)} songs.")
+    print(f"  ChordPro files: out/*.pro   (drag into BandHelper)")
+    print(f"  Batch-import fallback: {os.path.relpath(tsv, HERE)}")
+
+
+if __name__ == "__main__":
+    main()
