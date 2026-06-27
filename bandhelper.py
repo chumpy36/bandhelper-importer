@@ -102,9 +102,13 @@ def getsongbpm(title, artist):
 
 
 # ----------------------------------------------------------------------------- chords
+# root + any sequence of quality tokens (maj, min, m, sus, add, dim, aug, …)
+# and extensions (7, 9, b5, #11, …), plus optional slash bass. Permissive
+# enough for Amadd9 / Fmaj7/C / C#m7b5, strict enough to skip English words.
+_QUAL = r"(?:maj|min|sus|add|aug|dim|m|M|\+|°|ø)"
+_EXT = r"(?:[#b]?(?:11|13|2|4|5|6|7|9))"
 CHORD_RE = re.compile(
-    r"^[A-G][#b]?(?:m|maj|min|dim|aug|sus|add|M)?[0-9]?(?:[#b]?[0-9])?"
-    r"(?:/[A-G][#b]?)?$"
+    rf"^[A-G][#b]?(?:{_QUAL}|{_EXT})*(?:/[A-G][#b]?)?$"
 )
 
 
@@ -116,6 +120,25 @@ def _is_chord_line(line):
     return good == len(toks) and good >= 1
 
 
+def parse_chord_header(text):
+    """Pull optional Capo / Key from a UG chart's header lines.
+
+    UG pastes often start with 'Tuning: …  Key: Eb  Capo: 3rd fret' (sometimes
+    mashed onto one line). The transcriber's key/capo describe the actual
+    arrangement, so they should override the auto-detected GetSongBPM key.
+    Returns (capo, key) as strings ('' if absent)."""
+    head = text[:400]
+    capo = ""
+    m = re.search(r"Capo:\s*(\d+)", head, re.I)
+    if m:
+        capo = m.group(1)
+    key = ""
+    m = re.search(r"Key:\s*([A-G][#b]?m?)", head)
+    if m:
+        key = m.group(1)
+    return capo, key
+
+
 def ug_to_chordpro(text):
     """Convert Ultimate-Guitar copy-paste (chords above lyrics) to ChordPro."""
     out_lines = []
@@ -123,6 +146,10 @@ def ug_to_chordpro(text):
     i = 0
     while i < len(lines):
         line = lines[i].rstrip()
+        # Drop UG metadata header lines (Tuning:/Key:/Capo:) — parsed separately.
+        if re.match(r"^\s*(?:Tuning|Key|Capo)\s*:", line):
+            i += 1
+            continue
         # UG section headers: [Verse], [Chorus], etc.
         m = re.match(r"^\[(.+?)\]\s*$", line.strip())
         if m:
@@ -163,12 +190,15 @@ def _merge(chord_line, lyric_line):
 
 
 def load_chords(title):
+    """Return (chordpro_text, capo, key) for a pasted UG chart, or ('','','')."""
     for name in (title, title.lower()):
         p = os.path.join(CHORDS_DIR, f"{name}.txt")
         if os.path.exists(p):
             with open(p, encoding="utf-8") as f:
-                return ug_to_chordpro(f.read())
-    return ""
+                raw = f.read()
+            capo, key = parse_chord_header(raw)
+            return ug_to_chordpro(raw), capo, key
+    return "", "", ""
 
 
 # ----------------------------------------------------------------------------- output
@@ -180,6 +210,8 @@ def write_chordpro(song, tag):
     lines = [f"{{title: {song['title']}}}", f"{{artist: {song['artist']}}}"]
     if song["key"]:
         lines.append(f"{{key: {song['key']}}}")
+    if song.get("capo"):
+        lines.append(f"{{capo: {song['capo']}}}")
     if song["bpm"]:
         lines.append(f"{{tempo: {song['bpm']}}}")
     if song["duration"]:
@@ -197,19 +229,33 @@ def write_chordpro(song, tag):
     return path
 
 
+# BandHelper's tab-delimited Songs import expects this EXACT 16-column order
+# (no header row; line breaks inside a field encoded as literal \n).
 TSV_COLS = ["Title", "Artist", "Tags", "Key", "Time signature", "Tempo",
-            "Duration", "Lyrics", "Chords"]
+            "Duration", "Starting pitch", "Document filenames",
+            "Recording filenames", "MIDI preset names", "Lyrics", "Chords",
+            "Notes", "MIDI song number", "MIDI program change"]
 
 
 def write_tsv(songs, tag):
-    path = os.path.join(OUT_DIR, "import.tsv")
+    # .txt extension because BandHelper's Songs > Batch Import requires it.
+    path = os.path.join(OUT_DIR, "import.txt")
     with open(path, "w", encoding="utf-8") as f:
         for s in songs:
-            row = [s["title"], s["artist"], tag, s["key"], "", s["bpm"],
-                   s["duration"],
-                   s["lyrics"].replace("\n", "\\n"),
-                   s["chords"].replace("\n", "\\n")]
-            f.write("\t".join(c or "" for c in row) + "\n")
+            notes = f"Capo {s['capo']}" if s.get("capo") else ""
+            # Mirror BandHelper's own ChordPro import: the inline-chord chart
+            # (which already contains the lyrics) goes in the main Lyrics field,
+            # which is shown by default and renders [chords]. Plain lyrics only
+            # when there's no chart.
+            body = s["chords"] or s["lyrics"]
+            row = {
+                "Title": s["title"], "Artist": s["artist"], "Tags": tag,
+                "Key": s["key"], "Tempo": s["bpm"], "Duration": s["duration"],
+                "Lyrics": body.replace("\n", "\\n"),
+                "Notes": notes,
+            }
+            line = [str(row.get(col, "") or "") for col in TSV_COLS]
+            f.write("\t".join(line) + "\n")
     return path
 
 
@@ -253,11 +299,15 @@ def main():
         title = c_title or title
         artist = c_artist or artist
         bpm, key = getsongbpm(title, artist)
+        chords, capo, chart_key = load_chords(title)
+        # The chart's own key (from the transcriber) wins over GetSongBPM's guess.
+        if chart_key:
+            key = chart_key
         song = {
             "title": title, "artist": artist, "duration": dur or "",
-            "bpm": bpm, "key": key,
+            "bpm": bpm, "key": key, "capo": capo,
             "lyrics": lyrics(title, artist),
-            "chords": load_chords(title),
+            "chords": chords,
         }
         got = []
         if dur:
@@ -265,7 +315,7 @@ def main():
         if bpm:
             got.append(f"{bpm} bpm")
         if key:
-            got.append(f"key {key}")
+            got.append(f"key {key}" + (f" capo {capo}" if capo else ""))
         if song["lyrics"]:
             got.append("lyrics")
         got.append("CHORDS" if song["chords"] else "no-chords(paste UG)")
@@ -277,8 +327,10 @@ def main():
 
     tsv = write_tsv(results, tag)
     print(f"\nDone. {len(results)} songs.")
-    print(f"  ChordPro files: out/*.pro   (drag into BandHelper)")
-    print(f"  Batch-import fallback: {os.path.relpath(tsv, HERE)}")
+    print(f"  Web app:  Repertoire > Songs > Batch Import  ->  "
+          f"{os.path.relpath(tsv, HERE)}")
+    print(f"  Mobile/ChordPro:  out/*.pro  (iOS/Android: Songs > Import > "
+          f"ChordPro)")
 
 
 if __name__ == "__main__":

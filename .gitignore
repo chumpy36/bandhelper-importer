@@ -7,3 +7,7 @@ out/
 # keep the empty dirs in the repo
 !chords/.gitkeep
 !out/.gitkeep
+
+# local cruft
+.DS_Store
+.wrangler/
